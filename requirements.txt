@@ -1,0 +1,11 @@
+flask
+flask-cors
+pdfplumber
+nltk
+faiss-cpu
+numpy
+rank-bm25
+transformers
+sentence-transformers
+torch
+gunicorn
