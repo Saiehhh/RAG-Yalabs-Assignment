@@ -45,7 +45,7 @@ Run the Application:
 Start the Flask app:
 bashpython app.py
 
-Access the chatbot at http://0.0.0.0:7860 in your browser.
+Access the chatbot at https://huggingface.co/spaces/saiehh/oasis-e1-chatbot in your browser.
 
 
 
@@ -75,3 +75,4 @@ This project is for educational and demonstration purposes. No specific license 
 Contact
 For issues or questions, open an issue on this GitHub repository or recreate the environment locally for debugging.
 Last updated: September 15, 2025, 07:20 PM IST
+
