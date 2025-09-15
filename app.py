@@ -1,22 +1,38 @@
+
 from flask import Flask, request, jsonify, render_template_string
 import pdfplumber
 import re
 import nltk
-from sentence_transformers import SentenceTransformer, util, CrossEncoder
-from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 import pickle
 import os
-from transformers import pipeline
 from flask_cors import CORS
+import logging
+import threading
+import time
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Download NLTK data (run once)
-nltk.download('punkt')
-nltk.download('punkt_tab')
+try:
+    nltk.download('punkt', quiet=True)
+    nltk.download('punkt_tab', quiet=True)
+except Exception as e:
+    logger.warning(f"NLTK download failed: {e}, but continuing...")
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS
+CORS(app)
+
+# Global variables for models (loaded once)
+sentence_model = None
+chunks = None
+index = None
+system_ready = False
+initialization_error = None
 
 # Modern Chatbot HTML Template with proper Jinja2 escaping
 HTML_TEMPLATE = '''
@@ -55,46 +71,69 @@ HTML_TEMPLATE = '''
 </head>
 <body class="bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50 min-h-screen">
   <div id="root"></div>
-
   <script type="text/babel">
     const {{ '{' }} useState, useRef, useEffect {{ '}' }} = React;
-
     function App() {{ '{' }}
-      const [messages, setMessages] = useState([
-        {{ '{' }}
-          id: 1,
-          text: "Hello! I'm your OASIS-E1 assistant. I can help you with questions about the OASIS-E1 manual. What would you like to know?",
-          isBot: true,
-          timestamp: new Date().toLocaleTimeString([], {{ '{' }}hour: '2-digit', minute:'2-digit'{{ '}' }})
-        {{ '}' }}
-      ]);
+      const [messages, setMessages] = useState([]);
       const [currentMessage, setCurrentMessage] = useState('');
       const [isLoading, setIsLoading] = useState(false);
+      const [systemStatus, setSystemStatus] = useState('Initializing...');
+      const [isReady, setIsReady] = useState(false);
       const messagesEndRef = useRef(null);
       const inputRef = useRef(null);
-
+      
       const scrollToBottom = () => {{ '{' }}
         messagesEndRef.current?.scrollIntoView({{ '{' }} behavior: "smooth" {{ '}' }});
       {{ '}' }};
-
+      
       useEffect(() => {{ '{' }}
         scrollToBottom();
       {{ '}' }}, [messages]);
 
-      const handleSendMessage = async () => {{ '{' }}
-        if (!currentMessage.trim() || isLoading) return;
+      useEffect(() => {{ '{' }}
+        // Check system status periodically
+        const checkStatus = async () => {{ '{' }}
+          try {{ '{' }}
+            const response = await fetch('/status');
+            const data = await response.json();
+            setSystemStatus(data.status);
+            
+            if (data.status === 'Ready') {{ '{' }}
+              setIsReady(true);
+              if (messages.length === 0) {{ '{' }}
+                setMessages([{{ '{' }}
+                  id: 1,
+                  text: "Hello! I'm your OASIS-E1 assistant. I can help you with questions about the OASIS-E1 manual. What would you like to know?",
+                  isBot: true,
+                  timestamp: new Date().toLocaleTimeString([], {{ '{' }}hour: '2-digit', minute:'2-digit'{{ '}' }})
+                {{ '}' }}]);
+              {{ '}' }}
+            {{ '}' }}
+          {{ '}' }} catch (error) {{ '{' }}
+            console.error('Status check failed:', error);
+            setSystemStatus('Error checking status');
+          {{ '}' }}
+        {{ '}' }};
 
+        checkStatus();
+        const interval = setInterval(checkStatus, 3000); // Check every 3 seconds
+        return () => clearInterval(interval);
+      {{ '}' }}, [messages.length]);
+
+      const handleSendMessage = async () => {{ '{' }}
+        if (!currentMessage.trim() || isLoading || !isReady) return;
+        
         const userMessage = {{ '{' }}
           id: Date.now(),
           text: currentMessage,
           isBot: false,
           timestamp: new Date().toLocaleTimeString([], {{ '{' }}hour: '2-digit', minute:'2-digit'{{ '}' }})
         {{ '}' }};
-
+        
         setMessages(prev => [...prev, userMessage]);
         setCurrentMessage('');
         setIsLoading(true);
-
+        
         try {{ '{' }}
           const response = await fetch('/ask', {{ '{' }}
             method: 'POST',
@@ -112,7 +151,6 @@ HTML_TEMPLATE = '''
             isBot: true,
             timestamp: new Date().toLocaleTimeString([], {{ '{' }}hour: '2-digit', minute:'2-digit'{{ '}' }})
           {{ '}' }};
-
           setMessages(prev => [...prev, botMessage]);
         {{ '}' }} catch (error) {{ '{' }}
           const errorMessage = {{ '{' }}
@@ -136,14 +174,14 @@ HTML_TEMPLATE = '''
       {{ '}' }};
 
       const clearChat = () => {{ '{' }}
-        setMessages([
-          {{ '{' }}
+        if (isReady) {{ '{' }}
+          setMessages([{{ '{' }}
             id: 1,
             text: "Hello! I'm your OASIS-E1 assistant. I can help you with questions about the OASIS-E1 manual. What would you like to know?",
             isBot: true,
             timestamp: new Date().toLocaleTimeString([], {{ '{' }}hour: '2-digit', minute:'2-digit'{{ '}' }})
-          {{ '}' }}
-        ]);
+          {{ '}' }}]);
+        {{ '}' }}
       {{ '}' }};
 
       const quickQuestions = [
@@ -153,6 +191,35 @@ HTML_TEMPLATE = '''
         "Explain medication management",
         "What are the documentation requirements?"
       ];
+
+      // Show initialization screen
+      if (!isReady) {{ '{' }}
+        return (
+          <div className="flex flex-col h-screen max-w-4xl mx-auto bg-white shadow-2xl">
+            <div className="bg-gradient-to-r from-blue-600 to-indigo-700 p-4 text-white">
+              <div className="flex items-center space-x-3">
+                <div className="w-10 h-10 bg-white bg-opacity-20 rounded-full flex items-center justify-center">
+                  <svg className="w-6 h-6 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                </div>
+                <div>
+                  <h1 className="text-xl font-bold">OASIS-E1 Chatbot</h1>
+                  <p className="text-blue-100 text-sm">Status: {{ '{' }}systemStatus{{ '}' }}</p>
+                </div>
+              </div>
+            </div>
+            <div className="flex-1 flex items-center justify-center">
+              <div className="text-center">
+                <div className="w-16 h-16 border-4 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                <h2 className="text-xl font-semibold text-gray-700 mb-2">Initializing System</h2>
+                <p className="text-gray-500">{{ '{' }}systemStatus{{ '}' }}</p>
+                <p className="text-sm text-gray-400 mt-2">This may take a few moments...</p>
+              </div>
+            </div>
+          </div>
+        );
+      {{ '}' }}
 
       return (
         <div className="flex flex-col h-screen max-w-4xl mx-auto bg-white shadow-2xl">
@@ -167,7 +234,7 @@ HTML_TEMPLATE = '''
                 </div>
                 <div>
                   <h1 className="text-xl font-bold">OASIS-E1 Chatbot</h1>
-                  <p className="text-blue-100 text-sm">Your healthcare documentation assistant</p>
+                  <p className="text-blue-100 text-sm">Status: {{ '{' }}systemStatus{{ '}' }}</p>
                 </div>
               </div>
               <button 
@@ -178,7 +245,7 @@ HTML_TEMPLATE = '''
               </button>
             </div>
           </div>
-
+          
           {/* Messages Container */}
           <div className="flex-1 overflow-y-auto p-4 space-y-4 chat-container">
             {{ '{' }}messages.map((message) => (
@@ -228,7 +295,7 @@ HTML_TEMPLATE = '''
             ){{ '}' }}
             <div ref={{ '{' }}messagesEndRef{{ '}' }} />
           </div>
-
+          
           {/* Quick Questions */}
           {{ '{' }}messages.length === 1 && (
             <div className="px-4 py-2 bg-gray-50 border-t">
@@ -246,7 +313,7 @@ HTML_TEMPLATE = '''
               </div>
             </div>
           ){{ '}' }}
-
+          
           {/* Input Area */}
           <div className="p-4 bg-white border-t border-gray-200">
             <div className="flex space-x-3">
@@ -282,137 +349,336 @@ HTML_TEMPLATE = '''
         </div>
       );
     {{ '}' }}
-
     ReactDOM.render(<App />, document.getElementById('root'));
   </script>
 </body>
 </html>
 '''
 
-# Step 1: Parse and Clean PDF
-def parse_pdf(pdf_path):
-    chunks = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text()
-            if text:
-                text = re.sub(r'\nPage \d+\n', '', text)
-                text = re.sub(r'OASIS-E1\s+Effective 01/01/2025\s+Centers for Medicare & Medicaid Services\s+\w+', '', text)
-                text = re.sub(r'\s+', ' ', text).strip()
-                sections = re.split(r'\n([A-Z0-9\.\s]{5,})\n', text)
-                for i in range(0, len(sections), 2):
-                    section_title = sections[i].strip() if i < len(sections) else ''
-                    section_text = sections[i+1].strip() if i+1 < len(sections) else sections[i]
-                    paras = re.split(r'\n\n', section_text)
-                    for para in paras:
-                        para = para.strip()
-                        if len(para) > 50:
-                            chunk = f"{section_title}\n{para}".strip()
-                            chunks.append({"text": chunk, "metadata": {"page": page_num, "section": section_title}})
-    return chunks
+def get_pdf_path():
+    """Find the PDF file in the current directory"""
+    possible_names = [
+        "draft-oasis-e1-manual-04-28-2024.pdf",
+        "oasis-e1-manual.pdf", 
+        "manual.pdf"
+    ]
+    
+    for name in possible_names:
+        if os.path.exists(name):
+            logger.info(f"Found PDF: {name}")
+            return name
+    
+    # List all files in current directory
+    files = os.listdir(".")
+    pdf_files = [f for f in files if f.endswith('.pdf')]
+    
+    if pdf_files:
+        logger.info(f"Using first PDF found: {pdf_files[0]}")
+        return pdf_files[0]
+    
+    logger.error("No PDF file found!")
+    return None
 
-# Step 2: Chunking with overlap
-def chunk_with_overlap(chunks, max_tokens=512, overlap=100):
-    model = SentenceTransformer('all-MiniLM-L6-v2')
+def initialize_models():
+    """Initialize all models and load/build index"""
+    global sentence_model, chunks, index, system_ready, initialization_error
+    
+    try:
+        logger.info("Starting model initialization...")
+        
+        # Initialize sentence transformer model
+        logger.info("Loading sentence transformer...")
+        sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        logger.info("Sentence transformer loaded successfully")
+        
+        # Load or build index
+        if os.path.exists('faiss_index.bin') and os.path.exists('embeddings.pkl'):
+            logger.info("Loading existing index...")
+            load_index()
+        else:
+            logger.info("Building new index...")
+            pdf_path = get_pdf_path()
+            if pdf_path:
+                build_new_index(pdf_path)
+            else:
+                raise Exception("No PDF file found to build index")
+        
+        system_ready = True
+        logger.info("System initialization completed successfully!")
+        
+    except Exception as e:
+        initialization_error = str(e)
+        logger.error(f"Failed to initialize: {e}")
+        system_ready = False
+
+def load_index():
+    """Load existing index and chunks"""
+    global chunks, index
+    
+    try:
+        # Load chunks
+        with open('embeddings.pkl', 'rb') as f:
+            data = pickle.load(f)
+            chunks = data['chunks']
+        
+        # Load FAISS index
+        index = faiss.read_index('faiss_index.bin')
+        logger.info(f"Index loaded with {len(chunks)} chunks")
+        
+    except Exception as e:
+        logger.error(f"Failed to load index: {e}")
+        raise
+
+def build_new_index(pdf_path):
+    """Build new index from PDF"""
+    global chunks, index
+    
+    try:
+        logger.info("Parsing PDF...")
+        raw_chunks = parse_pdf(pdf_path)
+        
+        logger.info("Creating refined chunks...")
+        refined_chunks = chunk_with_overlap(raw_chunks)
+        
+        logger.info("Building FAISS index...")
+        index, chunks = build_index(refined_chunks)
+        
+    except Exception as e:
+        logger.error(f"Failed to build index: {e}")
+        raise
+
+def parse_pdf(pdf_path):
+    """Parse PDF and extract chunks"""
+    chunks = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+            logger.info(f"Processing {total_pages} pages...")
+            
+            for page_num, page in enumerate(pdf.pages, start=1):
+                if page_num % 10 == 0:
+                    logger.info(f"Processed {page_num}/{total_pages} pages")
+                
+                text = page.extract_text()
+                if text:
+                    # Clean text
+                    text = re.sub(r'\nPage \d+\n', '', text)
+                    text = re.sub(r'OASIS-E1\s+Effective 01/01/2025\s+Centers for Medicare & Medicaid Services\s+\w+', '', text)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    
+                    if len(text) > 100:  # Only keep substantial text
+                        chunks.append({
+                            "text": text, 
+                            "metadata": {"page": page_num}
+                        })
+        
+        logger.info(f"Extracted {len(chunks)} chunks from PDF")
+        return chunks
+        
+    except Exception as e:
+        logger.error(f"Error parsing PDF: {e}")
+        raise
+
+def chunk_with_overlap(chunks, max_length=1000, overlap=200):
+    """Create overlapping chunks"""
     refined_chunks = []
-    for chunk in chunks:
-        sentences = nltk.sent_tokenize(chunk['text'])
-        current_chunk = []
-        current_len = 0
-        for sent in sentences:
-            sent_len = len(model.encode(sent))
-            if current_len + sent_len > max_tokens and current_chunk:
-                refined_chunks.append({"text": ' '.join(current_chunk), "metadata": chunk['metadata']})
-                current_chunk = current_chunk[-overlap:] if overlap < len(current_chunk) else current_chunk
-                current_len = sum(len(model.encode(s)) for s in current_chunk)
-            current_chunk.append(sent)
-            current_len += sent_len
-        if current_chunk:
-            refined_chunks.append({"text": ' '.join(current_chunk), "metadata": chunk['metadata']})
+    
+    for i, chunk in enumerate(chunks):
+        text = chunk['text']
+        
+        # If text is short enough, keep as is
+        if len(text) <= max_length:
+            refined_chunks.append(chunk)
+            continue
+            
+        # Split long text into overlapping chunks
+        start = 0
+        while start < len(text):
+            end = start + max_length
+            chunk_text = text[start:end]
+            
+            refined_chunks.append({
+                "text": chunk_text,
+                "metadata": chunk['metadata']
+            })
+            
+            start = end - overlap
+            if start >= len(text):
+                break
+    
+    logger.info(f"Created {len(refined_chunks)} refined chunks")
     return refined_chunks
 
-# Step 3: Build Index
-def build_index(chunks, index_path='faiss_index', embeddings_path='embeddings.pkl'):
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    texts = [c['text'] for c in chunks]
-    embeddings = model.encode(texts, batch_size=32, show_progress_bar=True)
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
-    index.add(np.array(embeddings).astype('float32'))
-    faiss.write_index(index, index_path)
-    with open(embeddings_path, 'wb') as f:
-        pickle.dump({'chunks': chunks, 'embeddings': embeddings}, f)
-    print(f"Index built with {len(chunks)} chunks!")
-    return index, chunks
+def build_index(chunks, index_path='faiss_index.bin', embeddings_path='embeddings.pkl'):
+    """Build FAISS index from chunks"""
+    try:
+        texts = [c['text'] for c in chunks]
+        logger.info(f"Encoding {len(texts)} texts...")
+        
+        # Encode texts in batches
+        batch_size = 32
+        embeddings = []
+        
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i+batch_size]
+            batch_embeddings = sentence_model.encode(batch_texts, show_progress_bar=False)
+            embeddings.extend(batch_embeddings)
+            
+            if (i // batch_size + 1) % 10 == 0:
+                logger.info(f"Encoded {i + len(batch_texts)}/{len(texts)} texts")
+        
+        embeddings = np.array(embeddings)
+        
+        # Build FAISS index
+        dim = embeddings.shape[1]
+        index = faiss.IndexFlatL2(dim)
+        index.add(embeddings.astype('float32'))
+        
+        # Save index and chunks
+        faiss.write_index(index, index_path)
+        with open(embeddings_path, 'wb') as f:
+            pickle.dump({'chunks': chunks}, f)
+        
+        logger.info(f"Index built and saved with {len(chunks)} chunks!")
+        return index, chunks
+        
+    except Exception as e:
+        logger.error(f"Error building index: {e}")
+        raise
 
-# Step 4: Retrieve relevant chunks (with relevance threshold)
-def retrieve(query, index_path='faiss_index', embeddings_path='embeddings.pkl', top_k=5, relevance_threshold=0.3):
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-    with open(embeddings_path, 'rb') as f:
-        data = pickle.load(f)
-        chunks = data['chunks']
-        embeddings = data['embeddings']
-    index = faiss.read_index(index_path)
-    
-    query_emb = model.encode(query)
-    _, indices = index.search(np.array([query_emb]).astype('float32'), top_k * 2)
-    tokenized_corpus = [doc['text'].lower().split() for doc in chunks]
-    bm25 = BM25Okapi(tokenized_corpus)
-    bm25_scores = bm25.get_scores(query.lower().split())
-    candidates = [(i, util.cos_sim(query_emb, embeddings[i])[0][0].item() + bm25_scores[i]) for i in indices[0]]
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    top_indices = [i for i, _ in candidates[:top_k]]
-    rerank_inputs = [(query, chunks[i]['text']) for i in top_indices]
-    rerank_scores = cross_encoder.predict(rerank_inputs)
-    sorted_indices = np.argsort(rerank_scores)[::-1]
-    selected_chunks = [chunks[top_indices[j]] for j in sorted_indices]
-    # Deduplicate and check relevance
-    seen = set()
-    unique_chunks = []
-    max_score = max(rerank_scores) if rerank_scores.size else 0
-    if max_score < relevance_threshold:
-        return [{"text": "This question is not covered in the OASIS-E1 manual.", "metadata": {"page": 0, "section": "N/A"}}]
-    for c in selected_chunks:
-        if c['text'] not in seen:
-            seen.add(c['text'])
-            unique_chunks.append(c)
-    return unique_chunks[:top_k]
+def retrieve(query, top_k=5):
+    """Retrieve relevant chunks for query"""
+    try:
+        if not system_ready or sentence_model is None or index is None or chunks is None:
+            return [{"text": "System is still initializing. Please wait a moment and try again.", "metadata": {"page": 0}}]
+        
+        # Encode query
+        query_emb = sentence_model.encode([query])
+        
+        # Search FAISS index  
+        scores, indices = index.search(query_emb.astype('float32'), top_k)
+        
+        # Get top chunks
+        top_chunks = []
+        for i, idx in enumerate(indices[0]):
+            if idx < len(chunks) and scores[0][i] < 2.0:  # Distance threshold
+                top_chunks.append(chunks[idx])
+        
+        if not top_chunks:
+            return [{"text": "I couldn't find relevant information in the OASIS-E1 manual for your question.", "metadata": {"page": 0}}]
+        
+        return top_chunks
+        
+    except Exception as e:
+        logger.error(f"Error in retrieve: {e}")
+        return [{"text": "Error retrieving information. Please try again.", "metadata": {"page": 0}}]
 
-# Step 5: Generate Answer
 def generate_answer(query, contexts):
-    generator = pipeline('text-generation', model='distilgpt2')
-    if "This question is not covered" in contexts[0]['text']:
-        return "This question is not covered in the OASIS-E1 manual."
-    context_str = '\n\n'.join([f"From page {c['metadata']['page']}, section {c['metadata']['section']}: {c['text']}" for c in contexts])
-    prompt = f"Question: {query}\n\nContext: {context_str}\n\nAnswer the question based only on the context above. Be accurate, concise, and avoid repetition:"
-    response = generator(prompt, max_length=300, num_return_sequences=1, truncation=True, no_repeat_ngram_size=3)[0]['generated_text']
-    return response.split("Answer the question based only on the context above. Be accurate, concise, and avoid repetition:")[-1].strip()
+    """Generate answer from retrieved contexts"""
+    try:
+        if not contexts:
+            return "I couldn't find relevant information for your question."
+            
+        # Handle special messages
+        first_text = contexts[0]['text']
+        if "System is still initializing" in first_text or "Error" in first_text or "couldn't find relevant" in first_text:
+            return first_text
+        
+        # Create answer from contexts
+        answer_parts = []
+        seen_content = set()
+        
+        for context in contexts[:3]:  # Use top 3 contexts
+            text = context['text'][:500]  # Limit length
+            
+            # Avoid duplicate content
+            content_hash = hash(text[:100])
+            if content_hash in seen_content:
+                continue
+            seen_content.add(content_hash)
+            
+            page = context['metadata'].get('page', 'Unknown')
+            answer_parts.append(f"From page {page}: {text}")
+        
+        if answer_parts:
+            answer = "\n\n".join(answer_parts)
+            return answer[:1500] + "..." if len(answer) > 1500 else answer
+        else:
+            return "I found some information but couldn't extract a clear answer. Please try rephrasing your question."
+            
+    except Exception as e:
+        logger.error(f"Error generating answer: {e}")
+        return "I encountered an error while generating the answer. Please try again."
 
-# Root Route: Serve the UI
+# Routes
+@app.route('/status', methods=['GET'])
+def status():
+    """Return system status"""
+    if initialization_error:
+        return jsonify({'status': f'Error: {initialization_error}'})
+    elif system_ready:
+        return jsonify({'status': 'Ready'})
+    elif sentence_model is None:
+        return jsonify({'status': 'Loading models...'})
+    elif index is None:
+        return jsonify({'status': 'Building index...'})
+    else:
+        return jsonify({'status': 'Initializing...'})
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'ready': system_ready})
+
 @app.route('/', methods=['GET'])
-def index():
+def index_route():
+    """Serve the chatbot UI"""
     return render_template_string(HTML_TEMPLATE)
 
-# API Endpoint for Queries
 @app.route('/ask', methods=['POST'])
 def ask():
-    data = request.get_json()
-    query = data.get('query', '')
-    if not query:
-        return jsonify({'error': 'No query provided'}), 400
+    """Handle chat queries"""
     try:
-        if not os.path.exists('faiss_index') or not os.path.exists('embeddings.pkl'):
-            print("Building index... This may take 10-20 minutes.")
-            raw_chunks = parse_pdf("draft-oasis-e1-manual-04-28-2024.pdf")
-            refined_chunks = chunk_with_overlap(raw_chunks)
-            build_index(refined_chunks)
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No JSON data provided'}), 400
+            
+        query = data.get('query', '').strip()
+        
+        if not query:
+            return jsonify({'error': 'No query provided'}), 400
+        
+        logger.info(f"Query received: {query[:100]}...")
+        
+        # Check if system is ready
+        if not system_ready:
+            return jsonify({'answer': 'System is still initializing. Please wait a moment and try again.'})
+        
+        # Retrieve relevant contexts
         contexts = retrieve(query)
+        
+        # Generate answer
         answer = generate_answer(query, contexts)
+        
+        logger.info("Answer generated successfully")
         return jsonify({'answer': answer})
+        
     except Exception as e:
-        print(f"Error: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error in ask endpoint: {e}")
+        return jsonify({'error': 'Internal server error. Please try again.'}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    logger.info("Starting OASIS-E1 Chatbot...")
+    
+    # Initialize models in background thread
+    def init_in_background():
+        logger.info("Background initialization started...")
+        initialize_models()
+    
+    thread = threading.Thread(target=init_in_background)
+    thread.daemon = True
+    thread.start()
+    
+    # Start Flask app
+    port = int(os.environ.get("PORT", 7860))
+    app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
